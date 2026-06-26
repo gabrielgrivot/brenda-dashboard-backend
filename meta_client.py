@@ -10,8 +10,11 @@ META_BASE = "https://graph.facebook.com/v19.0"
 TOKEN     = os.getenv("META_ACCESS_TOKEN", "")
 ACCOUNT   = os.getenv("META_AD_ACCOUNT_ID", "")
 
-FIELDS_ACCOUNT  = ["spend","impressions","reach","clicks","ctr","cpm","cpc","frequency","actions","cost_per_action_type"]
-FIELDS_CAMPAIGN = ["id","name","objective","status","spend","impressions","reach","clicks","ctr","cpm","cpc","actions","cost_per_action_type"]
+# Campos para account-level (sem status)
+FIELDS_ACCOUNT = ["spend","impressions","reach","clicks","ctr","cpm","cpc","frequency","actions","cost_per_action_type"]
+
+# Campos para campaign-level insights (sem status e objective - esses vêm separado)
+FIELDS_CAMPAIGN_INSIGHTS = ["campaign_id","campaign_name","spend","impressions","reach","clicks","ctr","cpm","cpc","actions","cost_per_action_type"]
 
 def _get(path, params):
     params["access_token"] = TOKEN
@@ -19,10 +22,9 @@ def _get(path, params):
     r.raise_for_status()
     return r.json()
 
-def _date_range():
-    """Sempre busca do dia 16/05/2025 até hoje — período real da Brenda"""
+def _time_range_str():
     today = date.today()
-    return {"since": "2025-05-16", "until": today.isoformat()}
+    return f'{{"since":"2025-05-16","until":"{today.isoformat()}"}}'
 
 def _extract_action(actions, action_type):
     for a in (actions or []):
@@ -49,10 +51,6 @@ def sync_meta_data():
         logger.error("Erro no sync Meta: %s", e)
         _load_demo_data()
 
-def _time_range_str():
-    dr = _date_range()
-    return f'{{"since":"{dr["since"]}","until":"{dr["until"]}"}}'
-
 def _sync_account():
     data = _get(f"act_{ACCOUNT}/insights", {
         "fields": ",".join(FIELDS_ACCOUNT),
@@ -65,16 +63,12 @@ def _sync_account():
 
     link_clicks = _extract_action(actions, "link_click")
     wpp_convs   = _extract_action(actions, "onsite_conversion.messaging_conversation_started_7d")
+    if wpp_convs == 0:
+        wpp_convs = _extract_action(actions, "onsite_conversion.total_messaging_connection")
     reactions   = _extract_action(actions, "post_reaction")
     engagement  = _extract_action(actions, "page_engagement")
     video_plays = _extract_action(actions, "video_view")
     cost_conv   = _extract_cost(cost_actions, "onsite_conversion.messaging_conversation_started_7d")
-
-    # Se wpp_convs vier 0, tenta outros tipos de ação de mensagem
-    if wpp_convs == 0:
-        wpp_convs = _extract_action(actions, "onsite_conversion.messaging_first_reply")
-    if wpp_convs == 0:
-        wpp_convs = _extract_action(actions, "onsite_conversion.total_messaging_connection")
 
     upsert_summary({
         "spend":          round(float(row.get("spend", 0)), 2),
@@ -94,32 +88,48 @@ def _sync_account():
     })
 
 def _sync_campaigns():
-    data = _get(f"act_{ACCOUNT}/insights", {
-        "fields": ",".join(FIELDS_CAMPAIGN),
+    # Busca insights por campanha
+    insights_data = _get(f"act_{ACCOUNT}/insights", {
+        "fields": ",".join(FIELDS_CAMPAIGN_INSIGHTS),
         "time_range": _time_range_str(),
         "level": "campaign",
         "limit": 50,
     })
-    for row in (data.get("data") or []):
+
+    # Busca status das campanhas separadamente
+    campaigns_data = _get(f"act_{ACCOUNT}/campaigns", {
+        "fields": "id,name,objective,status",
+        "limit": 50,
+    })
+    
+    # Cria dicionário de status por campaign_id
+    status_map = {}
+    for c in (campaigns_data.get("data") or []):
+        status_raw = c.get("status", "PAUSED")
+        status = "active" if status_raw == "ACTIVE" else "done" if status_raw in ("COMPLETED","ARCHIVED") else "off"
+        obj = c.get("objective", "")
+        status_map[c["id"]] = {
+            "status": status,
+            "objective": obj,
+            "camp_type": "eng" if "ENGAGEMENT" in obj else "link"
+        }
+
+    for row in (insights_data.get("data") or []):
         actions      = row.get("actions", [])
         cost_actions = row.get("cost_per_action_type", [])
-        status_raw   = row.get("status", "PAUSED")
-        status = "active" if status_raw == "ACTIVE" else "done" if status_raw in ("COMPLETED","ARCHIVED") else "off"
-        obj = row.get("objective", "")
-        camp_type = "eng" if "ENGAGEMENT" in obj else "link"
+        camp_id      = row.get("campaign_id", "")
+        camp_info    = status_map.get(camp_id, {"status":"off","objective":"","camp_type":"link"})
 
         wpp = _extract_action(actions, "onsite_conversion.messaging_conversation_started_7d")
-        if wpp == 0:
-            wpp = _extract_action(actions, "onsite_conversion.messaging_first_reply")
         if wpp == 0:
             wpp = _extract_action(actions, "onsite_conversion.total_messaging_connection")
 
         upsert_campaign({
-            "campaign_id":    row["id"],
-            "name":           row.get("name", ""),
-            "objective":      obj,
-            "status":         status,
-            "camp_type":      camp_type,
+            "campaign_id":    camp_id,
+            "name":           row.get("campaign_name", ""),
+            "objective":      camp_info["objective"],
+            "status":         camp_info["status"],
+            "camp_type":      camp_info["camp_type"],
             "spend":          round(float(row.get("spend", 0)), 2),
             "impressions":    int(row.get("impressions", 0)),
             "reach":          int(row.get("reach", 0)),
