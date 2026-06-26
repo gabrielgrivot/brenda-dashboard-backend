@@ -10,7 +10,7 @@ META_BASE = "https://graph.facebook.com/v19.0"
 TOKEN     = os.getenv("META_ACCESS_TOKEN", "")
 ACCOUNT   = os.getenv("META_AD_ACCOUNT_ID", "")
 
-FIELDS_ACCOUNT = ["spend","impressions","reach","clicks","ctr","cpm","cpc","frequency","actions","cost_per_action_type"]
+FIELDS_ACCOUNT  = ["spend","impressions","reach","clicks","ctr","cpm","cpc","frequency","actions","cost_per_action_type"]
 FIELDS_CAMPAIGN = ["id","name","objective","status","spend","impressions","reach","clicks","ctr","cpm","cpc","actions","cost_per_action_type"]
 
 def _get(path, params):
@@ -20,8 +20,9 @@ def _get(path, params):
     return r.json()
 
 def _date_range():
+    """Sempre busca do dia 16/05/2025 até hoje — período real da Brenda"""
     today = date.today()
-    return {"since": today.replace(day=1).isoformat(), "until": today.isoformat()}
+    return {"since": "2025-05-16", "until": today.isoformat()}
 
 def _extract_action(actions, action_type):
     for a in (actions or []):
@@ -48,71 +49,96 @@ def sync_meta_data():
         logger.error("Erro no sync Meta: %s", e)
         _load_demo_data()
 
+def _time_range_str():
+    dr = _date_range()
+    return f'{{"since":"{dr["since"]}","until":"{dr["until"]}"}}'
+
 def _sync_account():
     data = _get(f"act_{ACCOUNT}/insights", {
         "fields": ",".join(FIELDS_ACCOUNT),
-        "time_range": '{"since":"' + date.today().replace(day=1).isoformat() + '","until":"' + date.today().isoformat() + '"}',
+        "time_range": _time_range_str(),
         "level": "account",
     })
     row = (data.get("data") or [{}])[0]
     actions = row.get("actions", [])
     cost_actions = row.get("cost_per_action_type", [])
+
+    link_clicks = _extract_action(actions, "link_click")
+    wpp_convs   = _extract_action(actions, "onsite_conversion.messaging_conversation_started_7d")
+    reactions   = _extract_action(actions, "post_reaction")
+    engagement  = _extract_action(actions, "page_engagement")
+    video_plays = _extract_action(actions, "video_view")
+    cost_conv   = _extract_cost(cost_actions, "onsite_conversion.messaging_conversation_started_7d")
+
+    # Se wpp_convs vier 0, tenta outros tipos de ação de mensagem
+    if wpp_convs == 0:
+        wpp_convs = _extract_action(actions, "onsite_conversion.messaging_first_reply")
+    if wpp_convs == 0:
+        wpp_convs = _extract_action(actions, "onsite_conversion.total_messaging_connection")
+
     upsert_summary({
-        "spend": round(float(row.get("spend", 0)), 2),
-        "impressions": int(row.get("impressions", 0)),
-        "reach": int(row.get("reach", 0)),
-        "clicks": int(row.get("clicks", 0)),
-        "ctr": round(float(row.get("ctr", 0)), 2),
-        "cpm": round(float(row.get("cpm", 0)), 2),
-        "cpc": round(float(row.get("cpc", 0)), 2),
-        "frequency": round(float(row.get("frequency", 0)), 2),
-        "link_clicks": _extract_action(actions, "link_click"),
-        "wpp_convs": _extract_action(actions, "onsite_conversion.messaging_conversation_started_7d"),
-        "reactions": _extract_action(actions, "post_reaction"),
-        "engagement": _extract_action(actions, "page_engagement"),
-        "video_plays_3s": _extract_action(actions, "video_view"),
-        "cost_per_wpp": _extract_cost(cost_actions, "onsite_conversion.messaging_conversation_started_7d"),
+        "spend":          round(float(row.get("spend", 0)), 2),
+        "impressions":    int(row.get("impressions", 0)),
+        "reach":          int(row.get("reach", 0)),
+        "clicks":         int(row.get("clicks", 0)),
+        "ctr":            round(float(row.get("ctr", 0)), 2),
+        "cpm":            round(float(row.get("cpm", 0)), 2),
+        "cpc":            round(float(row.get("cpc", 0)), 2),
+        "frequency":      round(float(row.get("frequency", 0)), 2),
+        "link_clicks":    link_clicks,
+        "wpp_convs":      wpp_convs,
+        "reactions":      reactions,
+        "engagement":     engagement,
+        "video_plays_3s": video_plays,
+        "cost_per_wpp":   cost_conv,
     })
 
 def _sync_campaigns():
     data = _get(f"act_{ACCOUNT}/insights", {
         "fields": ",".join(FIELDS_CAMPAIGN),
-        "time_range": '{"since":"' + date.today().replace(day=1).isoformat() + '","until":"' + date.today().isoformat() + '"}',
+        "time_range": _time_range_str(),
         "level": "campaign",
         "limit": 50,
     })
     for row in (data.get("data") or []):
-        actions = row.get("actions", [])
+        actions      = row.get("actions", [])
         cost_actions = row.get("cost_per_action_type", [])
-        status_raw = row.get("status", "PAUSED")
+        status_raw   = row.get("status", "PAUSED")
         status = "active" if status_raw == "ACTIVE" else "done" if status_raw in ("COMPLETED","ARCHIVED") else "off"
         obj = row.get("objective", "")
         camp_type = "eng" if "ENGAGEMENT" in obj else "link"
+
+        wpp = _extract_action(actions, "onsite_conversion.messaging_conversation_started_7d")
+        if wpp == 0:
+            wpp = _extract_action(actions, "onsite_conversion.messaging_first_reply")
+        if wpp == 0:
+            wpp = _extract_action(actions, "onsite_conversion.total_messaging_connection")
+
         upsert_campaign({
-            "campaign_id": row["id"],
-            "name": row.get("name", ""),
-            "objective": obj,
-            "status": status,
-            "camp_type": camp_type,
-            "spend": round(float(row.get("spend", 0)), 2),
-            "impressions": int(row.get("impressions", 0)),
-            "reach": int(row.get("reach", 0)),
-            "clicks": int(row.get("clicks", 0)),
-            "ctr": round(float(row.get("ctr", 0)), 2),
-            "link_clicks": _extract_action(actions, "link_click"),
-            "wpp_convs": _extract_action(actions, "onsite_conversion.messaging_conversation_started_7d"),
-            "reactions": _extract_action(actions, "post_reaction"),
-            "engagement": _extract_action(actions, "page_engagement"),
+            "campaign_id":    row["id"],
+            "name":           row.get("name", ""),
+            "objective":      obj,
+            "status":         status,
+            "camp_type":      camp_type,
+            "spend":          round(float(row.get("spend", 0)), 2),
+            "impressions":    int(row.get("impressions", 0)),
+            "reach":          int(row.get("reach", 0)),
+            "clicks":         int(row.get("clicks", 0)),
+            "ctr":            round(float(row.get("ctr", 0)), 2),
+            "link_clicks":    _extract_action(actions, "link_click"),
+            "wpp_convs":      wpp,
+            "reactions":      _extract_action(actions, "post_reaction"),
+            "engagement":     _extract_action(actions, "page_engagement"),
             "video_plays_3s": _extract_action(actions, "video_view"),
-            "cost_per_wpp": _extract_cost(cost_actions, "onsite_conversion.messaging_conversation_started_7d"),
+            "cost_per_wpp":   _extract_cost(cost_actions, "onsite_conversion.messaging_conversation_started_7d"),
         })
 
 def _load_demo_data():
     upsert_summary({
-        "spend": 188.90, "impressions": 0, "reach": 0, "clicks": 0,
-        "ctr": 0, "cpm": 0, "cpc": 0.22, "frequency": 0,
-        "link_clicks": 877, "wpp_convs": 16, "reactions": 301,
-        "engagement": 7749, "video_plays_3s": 6416, "cost_per_wpp": 11.81,
+        "spend":188.90,"impressions":0,"reach":0,"clicks":0,
+        "ctr":0,"cpm":0,"cpc":0.22,"frequency":0,
+        "link_clicks":877,"wpp_convs":16,"reactions":301,
+        "engagement":7749,"video_plays_3s":6416,"cost_per_wpp":11.81,
     })
     for c in [
         {"campaign_id":"1","name":'Post "sempre me sinto na obrigação…"',"objective":"LINK_CLICKS","status":"done","camp_type":"link","spend":0,"impressions":0,"reach":0,"clicks":0,"ctr":0,"link_clicks":677,"wpp_convs":1,"reactions":168,"engagement":4758,"video_plays_3s":3902,"cost_per_wpp":0},
