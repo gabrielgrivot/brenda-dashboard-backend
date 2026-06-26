@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
 import logging
+import os
 from database import init_db, get_summary, get_campaigns, get_last_update
 from meta_client import sync_meta_data
 
@@ -52,6 +53,20 @@ def refresh():
     try:
         sync_meta_data()
         return {"ok": True, "synced_at": datetime.now().isoformat()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/reset")
+def reset():
+    """Apaga o banco e força nova sincronização com a Meta"""
+    try:
+        db_path = os.getenv("DB_PATH", "/tmp/dashboard.db")
+        if os.path.exists(db_path):
+            os.remove(db_path)
+            logger.info("Banco apagado: %s", db_path)
+        init_db()
+        sync_meta_data()
+        return {"ok": True, "message": "Banco resetado e dados sincronizados", "synced_at": datetime.now().isoformat()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
